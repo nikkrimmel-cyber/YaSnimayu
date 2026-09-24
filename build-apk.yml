@@ -1,0 +1,120 @@
+name: Build Nikita TV APK
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main, master ]
+
+permissions:
+  contents: read
+
+env:
+  ANDROID_HOME: /usr/local/lib/android/sdk
+  ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+  EXPECTED_BUILD_ID: NIKITATV-0.5.0-CONTROLS-EPG-1
+
+jobs:
+  build:
+    name: Build APK
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          SDKMANAGER="$(command -v sdkmanager || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -type f -name sdkmanager 2>/dev/null | sort -V | tail -n 1 || true)"
+          fi
+          if [ -z "$SDKMANAGER" ] || [ ! -x "$SDKMANAGER" ]; then
+            echo "sdkmanager not found"
+            exit 1
+          fi
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" "platform-tools" "platforms;android-35" "build-tools;35.0.0"
+
+      - name: Unpack Nikita TV project
+        shell: bash
+        run: |
+          set -euo pipefail
+          ZIP_FILE="$GITHUB_WORKSPACE/NikitaTV.zip"
+          test -f "$ZIP_FILE" || { echo "ERROR: NikitaTV.zip not found"; exit 1; }
+          echo "ZIP SHA256:"; sha256sum "$ZIP_FILE"
+          EXTRACT_DIR="$RUNNER_TEMP/nikitatv-src"
+          rm -rf "$EXTRACT_DIR" && mkdir -p "$EXTRACT_DIR"
+          unzip -q "$ZIP_FILE" -d "$EXTRACT_DIR"
+          SETTINGS_FILE="$(find "$EXTRACT_DIR" -type f -name settings.gradle | head -n 1 || true)"
+          test -n "$SETTINGS_FILE" || { echo "ERROR: settings.gradle not found"; exit 1; }
+          PROJECT_DIR="$(dirname "$SETTINGS_FILE")"
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Expected BUILD_ID: $EXPECTED_BUILD_ID"
+          test -f "$PROJECT_DIR/BUILD_ID.txt" || { echo "ERROR: BUILD_ID.txt missing"; exit 1; }
+          ACTUAL_BUILD_ID="$(tr -d '\r\n' < "$PROJECT_DIR/BUILD_ID.txt")"
+          echo "Actual BUILD_ID: $ACTUAL_BUILD_ID"
+          [ "$ACTUAL_BUILD_ID" = "$EXPECTED_BUILD_ID" ] || { echo "ERROR: wrong ZIP"; exit 1; }
+          grep -n "versionCode\|versionName\|media3_version\|compileSdk" "$PROJECT_DIR/app/build.gradle" || true
+          grep -q "versionCode 11" "$PROJECT_DIR/app/build.gradle" || { echo "ERROR: expected versionCode 11"; exit 1; }
+          grep -q "versionName '0.5.0'" "$PROJECT_DIR/app/build.gradle" || { echo "ERROR: expected versionName 0.5.0"; exit 1; }
+          grep -q "SOURCE_TIMEOUT_MS = 30000L" "$PROJECT_DIR/app/src/main/java/kz/nikita/tv/PlayerActivity.java" || { echo "ERROR: 30s timeout missing"; exit 1; }
+          grep -q "NikitaTV/0.5 Android" "$PROJECT_DIR/app/src/main/java/kz/nikita/tv/PlayerActivity.java" || { echo "ERROR: v0.5 player missing"; exit 1; }
+
+      - name: Set up Gradle 8.9
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.9'
+
+      - name: Build debug APK
+        shell: bash
+        run: |
+          set +e
+          set -o pipefail
+          cd "$PROJECT_DIR"
+          gradle --version
+          gradle --no-daemon --stacktrace --warning-mode all :app:assembleDebug 2>&1 | tee "$GITHUB_WORKSPACE/build-log.txt"
+          CODE=${PIPESTATUS[0]}
+          if [ "$CODE" -ne 0 ]; then
+            echo
+            echo "================ REAL ERROR SUMMARY ================"
+            grep -n -E "(^|[[:space:]])error:|cannot find symbol|no suitable method|no suitable constructor|method .* cannot be applied|FAILURE:|What went wrong:|Execution failed for task|A problem occurred|Android resource linking failed|Manifest merger failed|Could not resolve|requires.*compileSdk|minCompileSdk" "$GITHUB_WORKSPACE/build-log.txt" | head -n 200 || true
+            echo "===================================================="
+            exit "$CODE"
+          fi
+
+      - name: Prepare APK artifact
+        if: success()
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK="$PROJECT_DIR/app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          cp "$APK" "$GITHUB_WORKSPACE/NikitaTV-v0.5.0-debug.apk"
+          ls -lh "$GITHUB_WORKSPACE/NikitaTV-v0.5.0-debug.apk"
+
+      - name: Upload APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NikitaTV-v0.5.0-apk
+          path: NikitaTV-v0.5.0-debug.apk
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Upload build log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: NikitaTV-build-log
+          path: build-log.txt
+          if-no-files-found: ignore
+          retention-days: 7
